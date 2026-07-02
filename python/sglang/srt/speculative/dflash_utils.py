@@ -97,6 +97,12 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    # Linear DFLASH verify is a single chain, so backends in
+    # `_DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS` can reuse their built-in causal
+    # path and skip the custom mask. DFLASH_DDTREE is tree-shaped and ALWAYS
+    # needs the tree visibility mask, so the DDTree worker does not consult this
+    # policy -- it builds `custom_mask` unconditionally in
+    # `DFlashDDTreeVerifyInput.prepare_for_verify`.
     backend = attn_backend
     for _ in range(4):
         full_backend = getattr(backend, "full_attn_backend", None)

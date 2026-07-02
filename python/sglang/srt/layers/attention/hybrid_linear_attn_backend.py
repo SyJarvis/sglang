@@ -33,6 +33,13 @@ class MambaAttnBackendBase(AttentionBackend):
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.is_draft_worker = model_runner.is_draft_worker
+        # Tree-verify is entered for EAGLE topk>1 OR for DFLASH_DDTREE. DDTree is
+        # greedy (topk==1) but emits first-child / next-sibling retrieve tensors
+        # so the GDN/Mamba recurrent state advances along tree parents instead of
+        # the physical predecessor.
+        self.enable_tree_verify = self.topk > 1 or (
+            model_runner.spec_algorithm.is_dflash_ddtree()
+        )
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
@@ -197,7 +204,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if self.topk > 1:
+                if self.enable_tree_verify:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
@@ -497,7 +504,7 @@ class MambaAttnBackendBase(AttentionBackend):
             else None
         )
 
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if forward_mode.is_target_verify() and self.enable_tree_verify:
             # retrieve_* are None during capture, so skip the copy.
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
@@ -638,7 +645,7 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
-        if forward_mode.is_target_verify() and self.topk > 1:
+        if forward_mode.is_target_verify() and self.enable_tree_verify:
             if (
                 spec_info is not None
                 and getattr(spec_info, "retrieve_next_token", None) is not None
@@ -1072,14 +1079,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             state_indices_tensor,
             last_correct_step_indices,
         )
-        # conv intermediate uses the deduplicated sliding-window layout, so it
-        # needs the strided-read scatter variant.
-        fused_conv_window_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+        if intermediate_conv_window_cache.is_contiguous():
+            fused_mamba_state_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+        else:
+            # Deduplicated sliding-window conv intermediates are as_strided views.
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
 
         # Track indices for prefix cache
         if mamba_track_indices is not None:
@@ -1090,9 +1104,17 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-            fused_conv_window_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            if intermediate_conv_window_cache.is_contiguous():
+                fused_mamba_state_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+            else:
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )

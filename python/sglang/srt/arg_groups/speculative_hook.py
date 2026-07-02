@@ -242,6 +242,40 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_dflash_ddtree(server_args: ServerArgs) -> None:
+    """DDTree = tree-shaped DFlash. Reuse the linear-DFlash arg normalization first,
+    then enforce the tree-specific invariants.
+    """
+    # Reuse the DFLASH baseline normalization (num_steps=1, eagle_topk=1,
+    # draft-model-path / window-size checks, block_size resolution, etc.).
+    _handle_dflash(server_args)
+
+    tree_budget = server_args.speculative_dflash_tree_budget
+    if tree_budget is None:
+        raise ValueError(
+            "DFLASH_DDTREE requires --speculative-dflash-tree-budget to be set."
+        )
+    if int(tree_budget) <= 0:
+        raise ValueError(
+            "DFLASH_DDTREE requires --speculative-dflash-tree-budget to be a positive "
+            f"integer, got {tree_budget}."
+        )
+
+    # CUDA-graph capture locks the verify width, so the worker always emits
+    # exactly `1 + tree_budget` verify tokens (padding the tree when the heap
+    # drains early). Enforce strict equality at startup so any mismatch surfaces
+    # here rather than as a triton/cuda-graph RuntimeError mid-run.
+    draft_token_num = int(server_args.speculative_num_draft_tokens)
+    required = 1 + int(tree_budget)
+    if draft_token_num != required:
+        raise ValueError(
+            "DFLASH_DDTREE requires --speculative-num-draft-tokens == "
+            "1 + --speculative-dflash-tree-budget (cuda-graph shape lock). "
+            f"Got speculative_num_draft_tokens={draft_token_num}, "
+            f"tree_budget={tree_budget} (need == {required})."
+        )
+
+
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

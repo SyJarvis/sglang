@@ -1501,7 +1501,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DFLASH_DDTREE. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1536,6 +1536,13 @@ class ServerArgs:
     speculative_dflash_block_size: A[
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+    ] = None
+    speculative_dflash_tree_budget: A[
+        Optional[int],
+        Arg(
+            help="DFLASH_DDTREE only. Tree budget (max non-root tree nodes built from per-position top-k). "
+            "Forces --speculative-num-draft-tokens == 1 + tree_budget so cuda-graph capture sees a fixed verify width.",
+        ),
     ] = None
     speculative_accept_threshold_single: A[
         float,
