@@ -44,6 +44,11 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
     follow-up (the retrieve tensors are already plumbed through).
     """
 
+    draft_input_cls = DFlashDraftInputV2
+    verify_input_cls = DFlashDDTreeVerifyInput
+    forward_spec_algorithm = SpeculativeAlgorithm.DFLASH_DDTREE
+    spec_name = "DFLASH_DDTREE"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tree_budget = int(self.server_args.speculative_dflash_tree_budget)
@@ -56,7 +61,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         required = 1 + int(self.tree_budget)
         if draft_cap != required:
             raise RuntimeError(
-                "DFLASH_DDTREE requires --speculative-num-draft-tokens == "
+                f"{self.spec_name} requires --speculative-num-draft-tokens == "
                 "1 + tree_budget for cuda graph capture. Got "
                 f"speculative_num_draft_tokens={draft_cap}, "
                 f"tree_budget={self.tree_budget} (need == {required})."
@@ -185,6 +190,14 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         )
         return top_logits - log_z[:, None], top_ids
 
+    def _build_tree_from_topk(
+        self,
+        top_log_probs: torch.Tensor,
+        top_token_ids: torch.Tensor,
+        tree_budget: int,
+    ):
+        return build_ddtree_tree_from_topk(top_log_probs, top_token_ids, tree_budget)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -229,7 +242,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
 
         draft_input = batch.spec_info
         if draft_input is None:
-            draft_input = DFlashDraftInputV2.create_idle_input(device=device)
+            draft_input = self.draft_input_cls.create_idle_input(device=device)
             batch.spec_info = draft_input
 
         # ====================================================================
@@ -376,7 +389,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             input_embeds=input_embeds,
-            spec_algorithm=SpeculativeAlgorithm.DFLASH_DDTREE,
+            spec_algorithm=self.forward_spec_algorithm,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
@@ -440,7 +453,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
                 visibility,
                 retrieve_next_token_flat,
                 retrieve_next_sibling_flat,
-            ) = build_ddtree_tree_from_topk(
+            ) = self._build_tree_from_topk(
                 top_log_probs[0], top_token_ids[0], tree_budget
             )
         self._profile_mark(profile, "tree_build_cpu")
@@ -496,7 +509,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             .contiguous()
         )
 
-        verify_input = DFlashDDTreeVerifyInput(
+        verify_input = self.verify_input_cls(
             draft_token=tree_tokens.reshape(-1),
             positions=tree_positions.reshape(-1),
             draft_token_num=padded_q_len,

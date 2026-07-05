@@ -474,7 +474,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # if there is no aux layer, set to None
                     self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if (
+            self.spec_algorithm.is_dflash() or self.spec_algorithm.is_jetspec()
+        ) and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building DFlash context features.
@@ -505,7 +507,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and trained_target_layers != target_num_layers
             ):
                 logger.warning(
-                    "DFLASH draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
+                    "DFlash-style draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
                     "selecting capture layers based on the runtime target model.",
                     trained_target_layers,
                     target_num_layers,
@@ -1032,7 +1034,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if not hasattr(self.model, "set_dflash_layers_to_capture"):
                 raise ValueError(
                     f"Model {self.model.__class__.__name__} does not implement "
-                    "set_dflash_layers_to_capture, which is required for DFLASH."
+                    "set_dflash_layers_to_capture, which is required for DFlash-style speculative decoding."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 

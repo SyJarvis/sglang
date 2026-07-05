@@ -251,9 +251,12 @@ class FlashAttentionBackend(AttentionBackend):
         ) // self.page_size
         # Opt out of the seq_lens_cpu D2H only for dflash (the worker adapted to
         # the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the CPU mirror.
-        self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
             model_runner.server_args.speculative_algorithm
-        ).is_dflash()
+        )
+        self.needs_cpu_seq_lens = (
+            not self.spec_algorithm.supports_target_verify_for_draft()
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
@@ -264,6 +267,11 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.uses_tree_verify_mask = (
+            self.topk > 1
+            or self.spec_algorithm.is_dflash_ddtree()
+            or self.spec_algorithm.is_jetspec()
+        )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
@@ -438,9 +446,9 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 return
 
-            if forward_mode.is_target_verify() and self.topk > 1:
-                # topk>1 target verify: replay needs spec_info.positions and .custom_mask
-                # which are not populated at capture time.
+            if forward_mode.is_target_verify() and self.uses_tree_verify_mask:
+                # Tree target verify: replay needs spec_info.positions and
+                # .custom_mask, which are not populated at capture time.
                 self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
                 self.forward_metadata_spec_decode_expand = (
                     self.target_verify_metadata_topk_expand[bs]
@@ -639,7 +647,7 @@ class FlashAttentionBackend(AttentionBackend):
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if not self.uses_tree_verify_mask:
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + self.speculative_num_draft_tokens
                 ).to(torch.int32)
@@ -1040,7 +1048,7 @@ class FlashAttentionBackend(AttentionBackend):
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
-            and self.topk > 1
+            and self.uses_tree_verify_mask
             and not is_swa_layer
         )
 
@@ -1969,7 +1977,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 )
 
-        if self.topk > 1:
+        if self.uses_tree_verify_mask:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
                     max_bs, dtype=torch.int32, device=self.device
@@ -2167,7 +2175,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if not self.uses_tree_verify_mask:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
@@ -2186,7 +2194,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
                 self.target_verify_metadata[bs] = metadata
             else:
-                # Target Verify topk>1: two (or three with SWA) metadata objects
+                # Tree target verify: two (or three with SWA) metadata objects
                 metadata.cache_seqlens_int32 = self.target_verify_metadata_topk_normal[
                     "cache_seqlens"
                 ][:bs]
@@ -2487,7 +2495,7 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
 
         elif forward_mode.is_target_verify():
-            if self.topk <= 1:
+            if not self.uses_tree_verify_mask:
                 metadata = self.target_verify_metadata[bs]
                 metadata.cache_seqlens_int32.copy_(
                     (seq_lens + self.speculative_num_draft_tokens)

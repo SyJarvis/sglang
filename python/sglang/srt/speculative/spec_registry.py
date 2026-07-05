@@ -76,6 +76,12 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_dflash_ddtree(self) -> bool:
+        return False
+
+    def is_jetspec(self) -> bool:
+        return False
+
     def is_standalone(self) -> bool:
         return False
 
@@ -88,6 +94,9 @@ class CustomSpecAlgo:
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True
+
+    def carries_draft_hidden_states(self) -> bool:
+        return False
 
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass

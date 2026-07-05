@@ -37,8 +37,10 @@ class MambaAttnBackendBase(AttentionBackend):
         # greedy (topk==1) but emits first-child / next-sibling retrieve tensors
         # so the GDN/Mamba recurrent state advances along tree parents instead of
         # the physical predecessor.
-        self.enable_tree_verify = self.topk > 1 or (
-            model_runner.spec_algorithm.is_dflash_ddtree()
+        self.enable_tree_verify = (
+            self.topk > 1
+            or model_runner.spec_algorithm.is_dflash_ddtree()
+            or model_runner.spec_algorithm.is_jetspec()
         )
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool

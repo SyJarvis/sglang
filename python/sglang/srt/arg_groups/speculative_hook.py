@@ -95,10 +95,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH", "JETSPEC"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3, DFLASH, and JETSPEC only).",
                 server_args.speculative_algorithm,
             )
 
@@ -128,20 +128,20 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         algo.handle_server_args(server_args)
 
 
-def _handle_dflash(server_args: ServerArgs) -> None:
+def _handle_dflash(server_args: ServerArgs, *, algo_name: str = "DFLASH") -> None:
     if server_args.enable_dp_attention:
         raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
+            f"Currently {algo_name} speculative decoding does not support dp attention."
         )
 
     if server_args.pp_size != 1:
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            f"Currently {algo_name} speculative decoding only supports pp_size == 1."
         )
 
     if server_args.speculative_draft_model_path is None:
         raise ValueError(
-            "DFLASH speculative decoding requires setting --speculative-draft-model-path."
+            f"{algo_name} speculative decoding requires setting --speculative-draft-model-path."
         )
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
@@ -153,7 +153,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         server_args.speculative_num_steps = 1
     elif int(server_args.speculative_num_steps) != 1:
         logger.warning(
-            "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+            "%s only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+            algo_name,
             server_args.speculative_num_steps,
         )
         server_args.speculative_num_steps = 1
@@ -162,7 +163,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         server_args.speculative_eagle_topk = 1
     elif int(server_args.speculative_eagle_topk) != 1:
         logger.warning(
-            "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+            "%s only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+            algo_name,
             server_args.speculative_eagle_topk,
         )
         server_args.speculative_eagle_topk = 1
@@ -170,7 +172,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.speculative_dflash_block_size is not None:
         if int(server_args.speculative_dflash_block_size) <= 0:
             raise ValueError(
-                "DFLASH requires --speculative-dflash-block-size to be positive, "
+                f"{algo_name} requires --speculative-dflash-block-size to be positive, "
                 f"got {server_args.speculative_dflash_block_size}."
             )
         if server_args.speculative_num_draft_tokens is not None and int(
@@ -178,7 +180,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         ) != int(server_args.speculative_dflash_block_size):
             raise ValueError(
                 "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                "but they differ. For DFLASH they must match. "
+                f"but they differ. For {algo_name} they must match. "
                 f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
                 f"speculative_dflash_block_size={server_args.speculative_dflash_block_size}."
             )
@@ -207,16 +209,18 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             ).resolve_block_size(default=None)
         except Exception as e:
             logger.warning(
-                "Failed to infer DFLASH block_size from draft model config; "
+                "Failed to infer %s block_size from draft model config; "
                 "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                algo_name,
                 e,
             )
 
         if inferred_block_size is None:
             inferred_block_size = 16
             logger.warning(
-                "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                "speculative_num_draft_tokens is not set; defaulting to %d for %s.",
                 inferred_block_size,
+                algo_name,
             )
         server_args.speculative_num_draft_tokens = inferred_block_size
 
@@ -238,7 +242,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
         logger.warning(
-            "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+            "Mixed chunked prefill is disabled because of using %s speculative decoding.",
+            algo_name,
         )
 
 
@@ -248,7 +253,7 @@ def _handle_dflash_ddtree(server_args: ServerArgs) -> None:
     """
     # Reuse the DFLASH baseline normalization (num_steps=1, eagle_topk=1,
     # draft-model-path / window-size checks, block_size resolution, etc.).
-    _handle_dflash(server_args)
+    _handle_dflash(server_args, algo_name="DFLASH_DDTREE")
 
     tree_budget = server_args.speculative_dflash_tree_budget
     if tree_budget is None:
@@ -270,6 +275,36 @@ def _handle_dflash_ddtree(server_args: ServerArgs) -> None:
     if draft_token_num != required:
         raise ValueError(
             "DFLASH_DDTREE requires --speculative-num-draft-tokens == "
+            "1 + --speculative-dflash-tree-budget (cuda-graph shape lock). "
+            f"Got speculative_num_draft_tokens={draft_token_num}, "
+            f"tree_budget={tree_budget} (need == {required})."
+        )
+
+
+def _handle_jetspec(server_args: ServerArgs) -> None:
+    """JetSpec uses DFlash-style draft-head execution plus tree verification.
+
+    Keep this separate from _handle_dflash_ddtree so the public algorithm name
+    and validation errors remain JetSpec-specific.
+    """
+    _handle_dflash(server_args, algo_name="JETSPEC")
+
+    tree_budget = server_args.speculative_dflash_tree_budget
+    if tree_budget is None:
+        raise ValueError(
+            "JETSPEC requires --speculative-dflash-tree-budget to be set."
+        )
+    if int(tree_budget) <= 0:
+        raise ValueError(
+            "JETSPEC requires --speculative-dflash-tree-budget to be a positive "
+            f"integer, got {tree_budget}."
+        )
+
+    draft_token_num = int(server_args.speculative_num_draft_tokens)
+    required = 1 + int(tree_budget)
+    if draft_token_num != required:
+        raise ValueError(
+            "JETSPEC requires --speculative-num-draft-tokens == "
             "1 + --speculative-dflash-tree-budget (cuda-graph shape lock). "
             f"Got speculative_num_draft_tokens={draft_token_num}, "
             f"tree_budget={tree_budget} (need == {required})."

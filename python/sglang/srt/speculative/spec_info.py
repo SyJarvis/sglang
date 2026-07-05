@@ -34,6 +34,7 @@ class SpeculativeAlgorithm(Enum):
 
     DFLASH = auto()
     DFLASH_DDTREE = auto()
+    JETSPEC = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -119,6 +120,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash_ddtree(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH_DDTREE
 
+    def is_jetspec(self) -> bool:
+        return self == SpeculativeAlgorithm.JETSPEC
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -126,7 +130,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash() or self.is_jetspec()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -182,7 +186,11 @@ class SpeculativeAlgorithm(Enum):
             _handle_ngram,
         )
 
-        if self.is_dflash_ddtree():
+        if self.is_jetspec():
+            from sglang.srt.arg_groups.speculative_hook import _handle_jetspec
+
+            _handle_jetspec(server_args)
+        elif self.is_dflash_ddtree():
             _handle_dflash_ddtree(server_args)
         elif self.is_dflash():
             _handle_dflash(server_args)
@@ -209,6 +217,11 @@ class SpeculativeAlgorithm(Enum):
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
+
+        if self.is_jetspec():
+            from sglang.srt.speculative.jetspec_worker import JetSpecWorker
+
+            return JetSpecWorker
 
         if self.is_dflash_ddtree():
             # DDTree extends the V2 DFlash worker; only the decode round (tree
@@ -271,6 +284,8 @@ class SpecInputType(IntEnum):
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
     DFLASH_DDTREE_VERIFY = auto()
+    JETSPEC_DRAFT = auto()
+    JETSPEC_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -288,6 +303,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
             SpecInputType.DFLASH_DRAFT,
+            SpecInputType.JETSPEC_DRAFT,
         }
 
     def is_verify_input(self) -> bool:
@@ -296,6 +312,7 @@ class SpecInput(ABC):
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
             SpecInputType.DFLASH_DDTREE_VERIFY,
+            SpecInputType.JETSPEC_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 
@@ -346,8 +363,15 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash_ddtree():
-        from sglang.srt.speculative.dflash_ddtree_info import DFlashDDTreeVerifyInput
+    elif spec_algorithm.is_dflash_ddtree() or spec_algorithm.is_jetspec():
+        if spec_algorithm.is_jetspec():
+            from sglang.srt.speculative.jetspec_info import (
+                JetSpecVerifyInput as TreeVerifyInput,
+            )
+        else:
+            from sglang.srt.speculative.dflash_ddtree_info import (
+                DFlashDDTreeVerifyInput as TreeVerifyInput,
+            )
 
         # DDTree needs a tree visibility mask + retrieve tensors even on the
         # cuda-graph capture/warmup path; provide non-None placeholders so the
@@ -358,7 +382,7 @@ def create_dummy_verify_input(
         placeholder_retrieve = torch.zeros(
             (1, padded_q_len), dtype=torch.int32, device=device
         )
-        spec_info = DFlashDDTreeVerifyInput(
+        spec_info = TreeVerifyInput(
             draft_token=None,
             positions=None,
             draft_token_num=padded_q_len,

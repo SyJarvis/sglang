@@ -102,6 +102,8 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
+    draft_input_cls = DFlashDraftInputV2
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1303,7 +1305,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         bs = int(seq_lens.numel())
         device = bonus_tokens.device
-        return DFlashDraftInputV2(
+        return self.draft_input_cls(
             topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
@@ -1319,7 +1321,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         bs = int(new_seq_lens.numel())
         device = bonus_tokens.device
-        return DFlashDraftInputV2(
+        return self.draft_input_cls(
             topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
             bonus_tokens=bonus_tokens.to(dtype=torch.int64),
@@ -1398,12 +1400,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Decode / target-verify stage.
         if batch.spec_info is None:
-            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+            batch.spec_info = self.draft_input_cls.create_idle_input(
+                device=self.device
+            )
 
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError(
-                "DFLASH spec-v2 expected DFlashDraftInputV2 state on the running batch."
+                "DFlash-style spec-v2 expected DFlashDraftInputV2-compatible state on the running batch."
             )
 
         if batch.forward_mode.is_idle():

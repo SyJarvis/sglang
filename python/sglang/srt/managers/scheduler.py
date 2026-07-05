@@ -888,7 +888,7 @@ class Scheduler(
         min_free_slots = resolve_min_free_slots(
             self.server_args.min_free_slots_delay,
             self.max_running_requests,
-            is_dflash=self.spec_algorithm.is_dflash(),
+            is_dflash=self.spec_algorithm.supports_target_verify_for_draft(),
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
@@ -2147,8 +2147,14 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+        if self.spec_algorithm.is_dflash() or self.spec_algorithm.is_jetspec():
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                algo_name=(
+                    "JETSPEC" if self.spec_algorithm.is_jetspec() else "DFLASH"
+                ),
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
