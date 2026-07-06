@@ -1100,6 +1100,39 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=self.model_runner.dtype,
                     device=self.model_runner.device,
                 )
+        elif self.model_runner.spec_algorithm.is_dflash_ddtree():
+            from sglang.srt.speculative.dflash_ddtree_info import (
+                DFlashDDTreeVerifyInput,
+            )
+
+            # DDTree always needs the tree visibility mask + non-None retrieve
+            # tensors so the tree-aware capture/replay path fires. Contents are
+            # overwritten each replay by the worker.
+            padded_q_len = self.model_runner.server_args.speculative_num_draft_tokens
+            placeholder_retrieve = torch.zeros(
+                (1, padded_q_len), dtype=torch.int32, device=self.model_runner.device
+            )
+            spec_info = DFlashDDTreeVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=padded_q_len,
+                child_maps_per_req=[],
+                visibility_per_req=[],
+                custom_mask=(
+                    None
+                    if self.model_runner.is_draft_worker
+                    else self.buffers.custom_mask
+                ),
+                retrieve_next_token=placeholder_retrieve,
+                retrieve_next_sibling=placeholder_retrieve,
+                topk=1,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
+
         elif self.model_runner.spec_algorithm.is_dflash():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (

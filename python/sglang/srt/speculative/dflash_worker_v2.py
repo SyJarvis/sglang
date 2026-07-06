@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+import time
 from typing import List, Optional
 
 import torch
@@ -127,6 +129,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._profile_verify = os.environ.get("DFLASH_PROFILE_VERIFY") == "1"
+        self._profile_verify_every = max(
+            1, int(os.environ.get("DFLASH_PROFILE_VERIFY_EVERY", "32"))
+        )
+        self._profile_verify_count = 0
+        self._profile_verify_sums: dict[str, float] = {}
 
         # Draft runner (separate KV cache + attention backend).
         self._draft_worker = TpModelWorker(
@@ -257,6 +265,65 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
         )
+
+    def _profile_sync(self) -> None:
+        if self.device.startswith("cuda"):
+            torch.cuda.synchronize(self.device)
+
+    def _profile_start(self) -> Optional[dict[str, float]]:
+        if not self._profile_verify or self.tp_rank != 0:
+            return None
+        self._profile_sync()
+        now = time.perf_counter()
+        return {"_last": now, "_total_start": now}
+
+    def _profile_mark(
+        self, profile: Optional[dict[str, float]], name: str
+    ) -> None:
+        if profile is None:
+            return
+        self._profile_sync()
+        now = time.perf_counter()
+        profile[name] = profile.get(name, 0.0) + (now - profile["_last"]) * 1000.0
+        profile["_last"] = now
+
+    def _profile_finish(
+        self,
+        profile: Optional[dict[str, float]],
+        *,
+        label: str,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        if profile is None:
+            return
+        self._profile_sync()
+        now = time.perf_counter()
+        profile["total"] = (now - profile["_total_start"]) * 1000.0
+        self._profile_verify_count += 1
+        for key, value in profile.items():
+            if key.startswith("_"):
+                continue
+            sum_key = f"{label}.{key}"
+            self._profile_verify_sums[sum_key] = (
+                self._profile_verify_sums.get(sum_key, 0.0) + float(value)
+            )
+        if self._profile_verify_count % self._profile_verify_every != 0:
+            return
+        denom = float(self._profile_verify_every)
+        prefix = f"{label} profile avg over {self._profile_verify_every} verify steps"
+        if commit_lens is not None:
+            try:
+                prefix += f", last_commit_lens={commit_lens.detach().cpu().tolist()}"
+            except Exception:
+                pass
+        parts = []
+        for key in sorted(self._profile_verify_sums):
+            if not key.startswith(label + "."):
+                continue
+            short_key = key.split(".", 1)[1]
+            parts.append(f"{short_key}={self._profile_verify_sums[key] / denom:.3f}ms")
+            self._profile_verify_sums[key] = 0.0
+        logger.info("%s: %s", prefix, ", ".join(parts))
 
     def alloc_memory_pool(
         self,
@@ -1335,6 +1402,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        profile = self._profile_start()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -1489,10 +1557,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        self._profile_mark(profile, "draft_prepare")
 
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+        self._profile_mark(profile, "draft_forward")
 
         if self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
@@ -1509,6 +1579,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 lm_head=lm_head,
             ).view(bs, int(self.block_size) - 1)
+        self._profile_mark(profile, "draft_sample")
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -1553,6 +1624,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        self._profile_mark(profile, "verify_prepare")
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
@@ -1562,6 +1634,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        self._profile_mark(profile, "target_verify")
 
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
@@ -1654,6 +1727,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens.scatter_(
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
+        self._profile_mark(profile, "accept")
 
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -1662,6 +1736,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
             )
+        self._profile_mark(profile, "mamba_update")
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
@@ -1683,6 +1758,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             positions=positions,
             commit_lens=commit_lens,
         )
+        self._profile_mark(profile, "draft_kv_append")
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
@@ -1691,6 +1767,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        self._profile_finish(profile, label="DFLASH", commit_lens=commit_lens)
 
         return GenerationBatchResult(
             logits_output=logits_output,

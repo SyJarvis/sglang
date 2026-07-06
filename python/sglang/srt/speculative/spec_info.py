@@ -33,6 +33,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DFLASH_DDTREE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -107,7 +108,16 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
     def is_dflash(self) -> bool:
-        return self == SpeculativeAlgorithm.DFLASH
+        # DFLASH_DDTREE is a tree-shaped variant that reuses the entire DFLASH
+        # execution chain (cuda-graph sites, scheduler/pool accounting, target
+        # verify for draft); tree-specific behaviour is gated on is_dflash_ddtree().
+        return self in (
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DFLASH_DDTREE,
+        )
+
+    def is_dflash_ddtree(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH_DDTREE
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -166,12 +176,15 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dflash_ddtree,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
         )
 
-        if self.is_dflash():
+        if self.is_dflash_ddtree():
+            _handle_dflash_ddtree(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
@@ -196,6 +209,13 @@ class SpeculativeAlgorithm(Enum):
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
+
+        if self.is_dflash_ddtree():
+            # DDTree extends the V2 DFlash worker; only the decode round (tree
+            # drafting / tree verify / tree commit) is overridden.
+            from sglang.srt.speculative.dflash_ddtree_worker import DFlashDDTreeWorker
+
+            return DFlashDDTreeWorker
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -250,6 +270,7 @@ class SpecInputType(IntEnum):
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
+    DFLASH_DDTREE_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -274,6 +295,7 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
+            SpecInputType.DFLASH_DDTREE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 
@@ -324,6 +346,33 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
+    elif spec_algorithm.is_dflash_ddtree():
+        from sglang.srt.speculative.dflash_ddtree_info import DFlashDDTreeVerifyInput
+
+        # DDTree needs a tree visibility mask + retrieve tensors even on the
+        # cuda-graph capture/warmup path; provide non-None placeholders so the
+        # tree-aware branches in the attention backends fire. Contents are
+        # overwritten each replay by the worker.
+        padded_q_len = server_args.speculative_num_draft_tokens
+        device = custom_mask.device if custom_mask is not None else torch.device("cuda")
+        placeholder_retrieve = torch.zeros(
+            (1, padded_q_len), dtype=torch.int32, device=device
+        )
+        spec_info = DFlashDDTreeVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=padded_q_len,
+            child_maps_per_req=[],
+            visibility_per_req=[],
+            custom_mask=custom_mask,
+            retrieve_next_token=placeholder_retrieve,
+            retrieve_next_sibling=placeholder_retrieve,
+            topk=1,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
     elif spec_algorithm.is_dflash():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 

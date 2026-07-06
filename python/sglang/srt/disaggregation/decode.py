@@ -198,6 +198,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        spec_tree_verify: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -242,6 +243,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            spec_tree_verify=spec_tree_verify,
         )
 
     def clear(self):

@@ -104,7 +104,10 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    spec_tree_verify: bool = False,
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
@@ -115,7 +118,17 @@ def conv_window_dedup_enabled(
     columns can need different values from different parent chains -> fall back to
     the dense layout. NPU/CPU also keep the dense layout (their kernels assume
     contiguous per-step windows). See ``MambaPool.__init__``.
+
+    ``spec_tree_verify`` is an explicit tree-verify disqualifier for algorithms that
+    do tree-shaped verify while keeping ``speculative_eagle_topk == 1`` (e.g.
+    DFLASH_DDTREE, which the arg normalization forces to topk=1). For those the
+    ``topk <= 1`` heuristic wrongly reads "linear chain": sibling tree nodes at
+    consecutive step indices would alias-overwrite each other's overlapping conv
+    window columns, corrupting the post-verify conv-state write-back. Force the
+    dense layout in that case.
     """
+    if spec_tree_verify:
+        return False
     return (
         not is_npu
         and not is_cpu
@@ -362,6 +375,7 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
+        spec_tree_verify: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
@@ -530,7 +544,7 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, spec_tree_verify
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:
@@ -831,6 +845,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        spec_tree_verify: bool = False,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
         enable_linear_replayssm: bool = False,
@@ -859,6 +874,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            spec_tree_verify=spec_tree_verify,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
@@ -874,6 +890,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        spec_tree_verify: bool = False,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
@@ -887,6 +904,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            spec_tree_verify=spec_tree_verify,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
