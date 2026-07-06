@@ -8,6 +8,40 @@ import numpy as np
 import torch
 
 
+class DFlashDDTreeBuildWorkspace:
+    def __init__(self) -> None:
+        self.top_log_probs_cpu: torch.Tensor | None = None
+        self.top_token_ids_cpu: torch.Tensor | None = None
+        self.node_token_ids_np: np.ndarray | None = None
+        self.node_depths_np: np.ndarray | None = None
+        self.parents_np: np.ndarray | None = None
+        self.visibility_np: np.ndarray | None = None
+        self.retrieve_next_token_np: np.ndarray | None = None
+        self.retrieve_next_sibling_np: np.ndarray | None = None
+        self.prev_sibling_of_parent_np: np.ndarray | None = None
+
+    def ensure(self, *, depth: int, topk: int, budget: int) -> None:
+        top_shape = (int(depth), int(topk))
+        if (
+            self.top_log_probs_cpu is None
+            or tuple(self.top_log_probs_cpu.shape) != top_shape
+        ):
+            self.top_log_probs_cpu = torch.empty(top_shape, dtype=torch.float32)
+            self.top_token_ids_cpu = torch.empty(top_shape, dtype=torch.long)
+
+        node_shape = (int(budget),)
+        tree_shape = (int(budget) + 1,)
+        visibility_shape = (int(budget) + 1, int(budget) + 1)
+        if self.node_token_ids_np is None or self.node_token_ids_np.shape != node_shape:
+            self.node_token_ids_np = np.empty(node_shape, dtype=np.int64)
+            self.node_depths_np = np.empty(node_shape, dtype=np.int64)
+            self.parents_np = np.empty(tree_shape, dtype=np.int32)
+            self.visibility_np = np.empty(visibility_shape, dtype=np.bool_)
+            self.retrieve_next_token_np = np.empty(tree_shape, dtype=np.int64)
+            self.retrieve_next_sibling_np = np.empty(tree_shape, dtype=np.int64)
+            self.prev_sibling_of_parent_np = np.empty(tree_shape, dtype=np.int64)
+
+
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
@@ -58,6 +92,7 @@ def build_ddtree_tree_from_topk(
     top_log_probs: torch.Tensor,
     top_token_ids: torch.Tensor,
     budget: int,
+    workspace: DFlashDDTreeBuildWorkspace | None = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -85,21 +120,44 @@ def build_ddtree_tree_from_topk(
     topk = min(int(budget), int(top_log_probs.shape[-1]))
     depth_limit = int(top_log_probs.shape[0])
 
-    top_log_probs_np = top_log_probs[:, :topk].to(
-        device="cpu", dtype=torch.float32
-    ).numpy()
-    top_token_ids_np = top_token_ids[:, :topk].to(
-        device="cpu", dtype=torch.long
-    ).numpy()
+    if workspace is not None:
+        workspace.ensure(depth=depth_limit, topk=topk, budget=int(budget))
+        assert workspace.top_log_probs_cpu is not None
+        assert workspace.top_token_ids_cpu is not None
+        workspace.top_log_probs_cpu.copy_(
+            top_log_probs[:, :topk].to(dtype=torch.float32), non_blocking=False
+        )
+        workspace.top_token_ids_cpu.copy_(
+            top_token_ids[:, :topk].to(dtype=torch.long), non_blocking=False
+        )
+        top_log_probs_np = workspace.top_log_probs_cpu.numpy()
+        top_token_ids_np = workspace.top_token_ids_cpu.numpy()
+        assert workspace.node_token_ids_np is not None
+        assert workspace.node_depths_np is not None
+        assert workspace.parents_np is not None
+        assert workspace.visibility_np is not None
+        assert workspace.retrieve_next_token_np is not None
+        assert workspace.retrieve_next_sibling_np is not None
+        assert workspace.prev_sibling_of_parent_np is not None
+        node_token_ids_np = workspace.node_token_ids_np
+        node_depths_np = workspace.node_depths_np
+        parents_np = workspace.parents_np
+    else:
+        top_log_probs_np = top_log_probs[:, :topk].to(
+            device="cpu", dtype=torch.float32
+        ).numpy()
+        top_token_ids_np = top_token_ids[:, :topk].to(
+            device="cpu", dtype=torch.long
+        ).numpy()
+        node_token_ids_np = np.empty(int(budget), dtype=np.int64)
+        node_depths_np = np.empty(int(budget), dtype=np.int64)
+        parents_np = np.empty(int(budget) + 1, dtype=np.int32)
 
     first_logw = float(top_log_probs_np[0, 0])
     heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = [
         (-first_logw, (0,), 0, 1, 0, first_logw)
     ]
 
-    node_token_ids_np = np.empty(int(budget), dtype=np.int64)
-    node_depths_np = np.empty(int(budget), dtype=np.int64)
-    parents_np = np.empty(int(budget) + 1, dtype=np.int32)
     parents_np[0] = -1
     child_maps: list[dict[int, int]] = [dict()]
     node_count = 0
@@ -143,16 +201,32 @@ def build_ddtree_tree_from_topk(
             )
 
     current_length = 1 + node_count
-    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
+    if workspace is not None:
+        assert workspace.visibility_np is not None
+        visibility_np = workspace.visibility_np[:current_length, :current_length]
+        visibility_np.fill(False)
+    else:
+        visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
     visibility_np[0, 0] = True
     for index in range(1, current_length):
         parent_index = int(parents_np[index])
         visibility_np[index, :index] = visibility_np[parent_index, :index]
         visibility_np[index, index] = True
 
-    retrieve_next_token_np = np.full(current_length, -1, dtype=np.int64)
-    retrieve_next_sibling_np = np.full(current_length, -1, dtype=np.int64)
-    prev_sibling_of_parent = np.full(current_length, -1, dtype=np.int64)
+    if workspace is not None:
+        assert workspace.retrieve_next_token_np is not None
+        assert workspace.retrieve_next_sibling_np is not None
+        assert workspace.prev_sibling_of_parent_np is not None
+        retrieve_next_token_np = workspace.retrieve_next_token_np[:current_length]
+        retrieve_next_sibling_np = workspace.retrieve_next_sibling_np[:current_length]
+        prev_sibling_of_parent = workspace.prev_sibling_of_parent_np[:current_length]
+        retrieve_next_token_np.fill(-1)
+        retrieve_next_sibling_np.fill(-1)
+        prev_sibling_of_parent.fill(-1)
+    else:
+        retrieve_next_token_np = np.full(current_length, -1, dtype=np.int64)
+        retrieve_next_sibling_np = np.full(current_length, -1, dtype=np.int64)
+        prev_sibling_of_parent = np.full(current_length, -1, dtype=np.int64)
     for child in range(1, current_length):
         parent = int(parents_np[child])
         if retrieve_next_token_np[parent] == -1:
@@ -228,6 +302,109 @@ def build_linear_ddtree_tree_from_topk(
     retrieve_next_sibling = torch.full((current_length,), -1, dtype=torch.long)
     for i in range(node_count):
         retrieve_next_token[i] = i + 1
+    return (
+        node_token_ids,
+        node_depths,
+        parents,
+        child_maps,
+        visibility,
+        retrieve_next_token,
+        retrieve_next_sibling,
+    )
+
+
+def _tree_aux_from_parents(
+    parents: list[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    current_length = len(parents)
+    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
+    visibility_np[0, 0] = True
+    for index in range(1, current_length):
+        parent_index = int(parents[index])
+        visibility_np[index, :index] = visibility_np[parent_index, :index]
+        visibility_np[index, index] = True
+
+    retrieve_next_token_np = np.full(current_length, -1, dtype=np.int64)
+    retrieve_next_sibling_np = np.full(current_length, -1, dtype=np.int64)
+    prev_sibling_of_parent = np.full(current_length, -1, dtype=np.int64)
+    for child in range(1, current_length):
+        parent = int(parents[child])
+        if retrieve_next_token_np[parent] == -1:
+            retrieve_next_token_np[parent] = child
+        else:
+            retrieve_next_sibling_np[prev_sibling_of_parent[parent]] = child
+        prev_sibling_of_parent[parent] = child
+
+    return (
+        torch.from_numpy(visibility_np),
+        torch.from_numpy(retrieve_next_token_np),
+        torch.from_numpy(retrieve_next_sibling_np),
+    )
+
+
+def build_chain_prefill_ddtree_tree_from_topk(
+    top_log_probs: torch.Tensor,
+    top_token_ids: torch.Tensor,
+    budget: int,
+    chain_len: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    List[int],
+    List[dict[int, int]],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Experimental tree shape: reserve a top-1 prefix chain, then branch.
+
+    This is deliberately opt-in. It tests whether DDTree's weak advantage comes
+    from spending too much of a small budget on shallow siblings instead of
+    preserving enough depth on the most likely path.
+    """
+
+    chain_len = max(0, min(int(chain_len), int(budget), int(top_token_ids.shape[0])))
+    if chain_len <= 0:
+        return build_ddtree_tree_from_topk(top_log_probs, top_token_ids, budget)
+    if chain_len >= int(budget) or chain_len >= int(top_token_ids.shape[0]):
+        return build_linear_ddtree_tree_from_topk(top_token_ids, budget)
+
+    remaining_budget = int(budget) - chain_len
+    (
+        sub_node_token_ids,
+        sub_node_depths,
+        sub_parents,
+        sub_child_maps,
+        _,
+        _,
+        _,
+    ) = build_ddtree_tree_from_topk(
+        top_log_probs[chain_len:],
+        top_token_ids[chain_len:],
+        remaining_budget,
+    )
+
+    chain_token_ids = top_token_ids[:chain_len, 0].to(device="cpu", dtype=torch.long)
+    chain_depths = torch.arange(1, chain_len + 1, dtype=torch.long)
+    node_token_ids = torch.cat([chain_token_ids, sub_node_token_ids], dim=0)
+    node_depths = torch.cat([chain_depths, sub_node_depths + chain_len], dim=0)
+
+    parents = [-1] + list(range(chain_len))
+    for parent in sub_parents[1:]:
+        parents.append(chain_len if int(parent) == 0 else chain_len + int(parent))
+
+    child_maps: list[dict[int, int]] = [dict() for _ in range(len(parents))]
+    for i, token_id in enumerate(chain_token_ids.tolist()):
+        child_maps[i][int(token_id)] = i + 1
+
+    for sub_idx, sub_map in enumerate(sub_child_maps):
+        global_idx = chain_len if sub_idx == 0 else chain_len + sub_idx
+        for token_id, child_idx in sub_map.items():
+            child_maps[global_idx][int(token_id)] = chain_len + int(child_idx)
+
+    visibility, retrieve_next_token, retrieve_next_sibling = _tree_aux_from_parents(
+        parents
+    )
     return (
         node_token_ids,
         node_depths,
