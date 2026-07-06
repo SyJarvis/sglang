@@ -40,6 +40,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.enable_tree_verify = (
             self.topk > 1
             or model_runner.spec_algorithm.is_dflash_ddtree()
+            or model_runner.spec_algorithm.is_treeflash()
             or model_runner.spec_algorithm.is_jetspec()
         )
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool

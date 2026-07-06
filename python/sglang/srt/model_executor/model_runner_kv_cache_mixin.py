@@ -560,6 +560,7 @@ class ModelRunnerKVCacheMixin:
                         speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                         spec_tree_verify=(
                             self.spec_algorithm.is_dflash_ddtree()
+                            or self.spec_algorithm.is_treeflash()
                             or self.spec_algorithm.is_jetspec()
                         ),
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
@@ -600,6 +601,7 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     spec_tree_verify=(
                         self.spec_algorithm.is_dflash_ddtree()
+                        or self.spec_algorithm.is_treeflash()
                         or self.spec_algorithm.is_jetspec()
                     ),
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,

@@ -34,6 +34,7 @@ class SpeculativeAlgorithm(Enum):
 
     DFLASH = auto()
     DFLASH_DDTREE = auto()
+    TREEFLASH = auto()
     JETSPEC = auto()
     EAGLE = auto()
     EAGLE3 = auto()
@@ -120,6 +121,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash_ddtree(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH_DDTREE
 
+    def is_treeflash(self) -> bool:
+        return self == SpeculativeAlgorithm.TREEFLASH
+
     def is_jetspec(self) -> bool:
         return self == SpeculativeAlgorithm.JETSPEC
 
@@ -130,7 +134,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash() or self.is_jetspec()
+        return self.is_dflash() or self.is_treeflash() or self.is_jetspec()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -190,6 +194,10 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.arg_groups.speculative_hook import _handle_jetspec
 
             _handle_jetspec(server_args)
+        elif self.is_treeflash():
+            from sglang.srt.arg_groups.speculative_hook import _handle_treeflash
+
+            _handle_treeflash(server_args)
         elif self.is_dflash_ddtree():
             _handle_dflash_ddtree(server_args)
         elif self.is_dflash():
@@ -222,6 +230,11 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.jetspec_worker import JetSpecWorker
 
             return JetSpecWorker
+
+        if self.is_treeflash():
+            from sglang.srt.speculative.treeflash_worker import TreeFlashWorker
+
+            return TreeFlashWorker
 
         if self.is_dflash_ddtree():
             # DDTree extends the V2 DFlash worker; only the decode round (tree
@@ -363,7 +376,11 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash_ddtree() or spec_algorithm.is_jetspec():
+    elif (
+        spec_algorithm.is_dflash_ddtree()
+        or spec_algorithm.is_treeflash()
+        or spec_algorithm.is_jetspec()
+    ):
         if spec_algorithm.is_jetspec():
             from sglang.srt.speculative.jetspec_info import (
                 JetSpecVerifyInput as TreeVerifyInput,

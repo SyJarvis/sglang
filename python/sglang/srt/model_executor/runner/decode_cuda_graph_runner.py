@@ -1105,6 +1105,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
         elif (
             self.model_runner.spec_algorithm.is_dflash_ddtree()
+            or self.model_runner.spec_algorithm.is_treeflash()
             or self.model_runner.spec_algorithm.is_jetspec()
         ):
             if self.model_runner.spec_algorithm.is_jetspec():

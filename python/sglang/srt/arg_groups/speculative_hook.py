@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -95,10 +96,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 f"--speculative-draft-window-size must be positive, got {window_size}."
             )
         server_args.speculative_draft_window_size = window_size
-        if server_args.speculative_algorithm not in ("EAGLE3", "DFLASH", "JETSPEC"):
+        if server_args.speculative_algorithm not in (
+            "EAGLE3",
+            "DFLASH",
+            "TREEFLASH",
+            "JETSPEC",
+        ):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3, DFLASH, and JETSPEC only).",
+                "speculative_algorithm=%s (honored by Llama EAGLE-3, DFLASH, TREEFLASH, and JETSPEC only).",
                 server_args.speculative_algorithm,
             )
 
@@ -279,6 +285,60 @@ def _handle_dflash_ddtree(server_args: ServerArgs) -> None:
             f"Got speculative_num_draft_tokens={draft_token_num}, "
             f"tree_budget={tree_budget} (need == {required})."
         )
+
+
+def _handle_treeflash(server_args: ServerArgs) -> None:
+    """TreeFlash = fixed tree-shaped DFlash with q-head pruning.
+
+    The draft and verify tensors currently use one fixed padded width:
+    `speculative_num_draft_tokens`. The q-head keeps at most
+    `speculative_dflash_tree_budget` non-root nodes inside that padded width.
+    """
+    _handle_dflash(server_args, algo_name="TREEFLASH")
+    _ensure_treeflash_draft_config_override(server_args)
+
+    draft_token_num = int(server_args.speculative_num_draft_tokens)
+    tree_budget = server_args.speculative_dflash_tree_budget
+    if tree_budget is None:
+        server_args.speculative_dflash_tree_budget = draft_token_num - 1
+        tree_budget = server_args.speculative_dflash_tree_budget
+    if int(tree_budget) <= 0:
+        raise ValueError(
+            "TREEFLASH requires --speculative-dflash-tree-budget to be positive "
+            f"when set, got {tree_budget}."
+        )
+    if int(tree_budget) >= draft_token_num:
+        raise ValueError(
+            "TREEFLASH requires --speculative-dflash-tree-budget < "
+            "--speculative-num-draft-tokens because the root consumes one slot. "
+            f"Got tree_budget={tree_budget}, speculative_num_draft_tokens={draft_token_num}."
+        )
+
+
+def _ensure_treeflash_draft_config_override(server_args: ServerArgs) -> None:
+    if server_args.decrypted_draft_config_file:
+        return
+
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    model_override_args = json.loads(server_args.json_model_override_args)
+    hf_config = get_config(
+        server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        model_override_args=model_override_args,
+    )
+    config_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(hf_config)
+    config_dict["architectures"] = ["TreeFlashDraftModel"]
+
+    fd, path = tempfile.mkstemp(prefix="sglang_treeflash_config_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f)
+    server_args.decrypted_draft_config_file = path
+    logger.info(
+        "TREEFLASH generated draft config override at %s with architectures=['TreeFlashDraftModel'].",
+        path,
+    )
 
 
 def _handle_jetspec(server_args: ServerArgs) -> None:

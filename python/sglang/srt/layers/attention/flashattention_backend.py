@@ -270,6 +270,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.uses_tree_verify_mask = (
             self.topk > 1
             or self.spec_algorithm.is_dflash_ddtree()
+            or self.spec_algorithm.is_treeflash()
             or self.spec_algorithm.is_jetspec()
         )
         self.speculative_num_steps = speculative_num_steps

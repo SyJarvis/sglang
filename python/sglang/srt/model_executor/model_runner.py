@@ -475,7 +475,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.eagle_aux_hidden_state_layer_ids = None
 
         if (
-            self.spec_algorithm.is_dflash() or self.spec_algorithm.is_jetspec()
+            self.spec_algorithm.is_dflash()
+            or self.spec_algorithm.is_treeflash()
+            or self.spec_algorithm.is_jetspec()
         ) and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 

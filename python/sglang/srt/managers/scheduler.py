@@ -2147,12 +2147,20 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash() or self.spec_algorithm.is_jetspec():
+        if (
+            self.spec_algorithm.is_dflash()
+            or self.spec_algorithm.is_treeflash()
+            or self.spec_algorithm.is_jetspec()
+        ):
             error_msg = validate_dflash_request(
                 req,
                 self.enable_overlap,
                 algo_name=(
-                    "JETSPEC" if self.spec_algorithm.is_jetspec() else "DFLASH"
+                    "JETSPEC"
+                    if self.spec_algorithm.is_jetspec()
+                    else "TREEFLASH"
+                    if self.spec_algorithm.is_treeflash()
+                    else "DFLASH"
                 ),
             )
             if error_msg is not None:

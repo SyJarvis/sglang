@@ -1501,7 +1501,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DFLASH_DDTREE, JETSPEC. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DFLASH_DDTREE, TREEFLASH, JETSPEC. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1540,8 +1540,14 @@ class ServerArgs:
     speculative_dflash_tree_budget: A[
         Optional[int],
         Arg(
-            help="DFLASH_DDTREE/JETSPEC only. Tree budget (max non-root tree nodes built from per-position top-k). "
+            help="DFLASH_DDTREE/TREEFLASH/JETSPEC only. Tree budget (max non-root tree nodes built/kept for tree verification). "
             "Forces --speculative-num-draft-tokens == 1 + tree_budget so cuda-graph capture sees a fixed verify width.",
+        ),
+    ] = None
+    speculative_treeflash_parent_indices: A[
+        Optional[str],
+        Arg(
+            help="TREEFLASH only. JSON list of root-inclusive parent indices for the fixed draft tree, e.g. [-1,0,1,1]. Defaults to a linear chain.",
         ),
     ] = None
     speculative_accept_threshold_single: A[

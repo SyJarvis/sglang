@@ -79,6 +79,9 @@ class CustomSpecAlgo:
     def is_dflash_ddtree(self) -> bool:
         return False
 
+    def is_treeflash(self) -> bool:
+        return False
+
     def is_jetspec(self) -> bool:
         return False
 
