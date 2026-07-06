@@ -15,6 +15,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.dflash_ddtree_info import DFlashDDTreeVerifyInput
 from sglang.srt.speculative.dflash_ddtree_utils import (
+    DFlashDDTreeBuildWorkspace,
+    build_chain_prefill_ddtree_tree_from_topk,
     build_ddtree_tree_from_topk,
     build_linear_ddtree_tree_from_topk,
     pad_ddtree_build_outputs,
@@ -47,6 +49,17 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tree_budget = int(self.server_args.speculative_dflash_tree_budget)
+        self._ddtree_topk_values_buf: torch.Tensor | None = None
+        self._ddtree_topk_indices_buf: torch.Tensor | None = None
+        self._ddtree_tree_tokens_buf: torch.Tensor | None = None
+        self._ddtree_tree_positions_buf: torch.Tensor | None = None
+        self._ddtree_retrieve_next_token_buf: torch.Tensor | None = None
+        self._ddtree_retrieve_next_sibling_buf: torch.Tensor | None = None
+        self._ddtree_next_token_ids_bufs: list[torch.Tensor] = []
+        self._ddtree_commit_lens_bufs: list[torch.Tensor] = []
+        self._ddtree_result_buf_index = 0
+        self._ddtree_accept_index_buf: torch.Tensor | None = None
+        self._ddtree_build_workspace = DFlashDDTreeBuildWorkspace()
         # CUDA graph capture locks the verify-sequence shape, so the worker must
         # always emit exactly `1 + tree_budget` verify tokens (padding the tree
         # to a fixed width when the heap drains early). `_handle_dflash_ddtree`
@@ -61,6 +74,76 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
                 f"speculative_num_draft_tokens={draft_cap}, "
                 f"tree_budget={self.tree_budget} (need == {required})."
             )
+
+    def _ensure_ddtree_topk_buffers(
+        self,
+        *,
+        num_tokens: int,
+        k: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (int(num_tokens), int(k))
+        if (
+            self._ddtree_topk_values_buf is None
+            or self._ddtree_topk_indices_buf is None
+            or tuple(self._ddtree_topk_values_buf.shape) != shape
+            or tuple(self._ddtree_topk_indices_buf.shape) != shape
+            or self._ddtree_topk_values_buf.dtype != dtype
+            or self._ddtree_topk_values_buf.device != device
+            or self._ddtree_topk_indices_buf.device != device
+        ):
+            self._ddtree_topk_values_buf = torch.empty(
+                shape, dtype=dtype, device=device
+            )
+            self._ddtree_topk_indices_buf = torch.empty(
+                shape, dtype=torch.long, device=device
+            )
+        return self._ddtree_topk_values_buf, self._ddtree_topk_indices_buf
+
+    def _ensure_ddtree_decode_buffers(
+        self,
+        *,
+        bs: int,
+        q_len: int,
+        device: torch.device,
+    ) -> None:
+        tree_shape = (int(bs), int(q_len))
+        if (
+            self._ddtree_tree_tokens_buf is None
+            or tuple(self._ddtree_tree_tokens_buf.shape) != tree_shape
+            or self._ddtree_tree_tokens_buf.device != device
+        ):
+            self._ddtree_tree_tokens_buf = torch.empty(
+                tree_shape, dtype=torch.long, device=device
+            )
+            self._ddtree_tree_positions_buf = torch.empty(
+                tree_shape, dtype=torch.int64, device=device
+            )
+            self._ddtree_retrieve_next_token_buf = torch.empty(
+                tree_shape, dtype=torch.int32, device=device
+            )
+            self._ddtree_retrieve_next_sibling_buf = torch.empty(
+                tree_shape, dtype=torch.int32, device=device
+            )
+            self._ddtree_next_token_ids_bufs = [
+                torch.empty(tree_shape, dtype=torch.int64, device=device)
+                for _ in range(2)
+            ]
+            self._ddtree_accept_index_buf = torch.empty(
+                tree_shape, dtype=torch.int64, device=device
+            )
+            self._ddtree_commit_lens_bufs = [
+                torch.empty((int(bs),), dtype=torch.int32, device=device)
+                for _ in range(2)
+            ]
+
+    def _next_ddtree_result_buffers(self, bs: int, q_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ddtree_result_buf_index ^= 1
+        return (
+            self._ddtree_next_token_ids_bufs[self._ddtree_result_buf_index][:bs, :q_len],
+            self._ddtree_commit_lens_bufs[self._ddtree_result_buf_index][:bs],
+        )
 
     def _topk_from_vocab_parallel_head(
         self,
@@ -134,6 +217,26 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
                 "DFLASH_DDTREE cannot compute logits from an empty vocab shard."
             )
 
+        if tp_size == 1 and num_added == 0 and len(logits_parts) == 1:
+            local_logits = logits_parts[0].float()
+            local_log_z = torch.logsumexp(local_logits, dim=-1)
+            local_k = min(int(k), int(local_logits.shape[-1]))
+            local_top_logits, local_top_ids = self._ensure_ddtree_topk_buffers(
+                num_tokens=int(local_logits.shape[0]),
+                k=local_k,
+                dtype=local_logits.dtype,
+                device=local_logits.device,
+            )
+            torch.topk(
+                local_logits,
+                k=local_k,
+                dim=-1,
+                out=(local_top_logits, local_top_ids),
+            )
+            if org_vocab_start:
+                local_top_ids.add_(org_vocab_start)
+            return local_top_logits - local_log_z[:, None], local_top_ids
+
         local_logits = torch.cat(logits_parts, dim=-1).float()
         local_ids = torch.cat(id_parts, dim=0)
         local_log_z = torch.logsumexp(local_logits, dim=-1)
@@ -184,6 +287,19 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             gathered_log_z.view(tp_size, num_tokens).transpose(0, 1), dim=-1
         )
         return top_logits - log_z[:, None], top_ids
+
+    def _build_tree_from_topk(
+        self,
+        top_log_probs: torch.Tensor,
+        top_token_ids: torch.Tensor,
+        tree_budget: int,
+    ):
+        return build_ddtree_tree_from_topk(
+            top_log_probs,
+            top_token_ids,
+            tree_budget,
+            workspace=self._ddtree_build_workspace,
+        )
 
     def forward_batch_generation(
         self,
@@ -409,6 +525,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         #                            depth_limit==1 and every node is a root child).
         _ddtree_force_linear = os.environ.get("DDTREE_FORCE_LINEAR") == "1"
         _ddtree_force_star = os.environ.get("DDTREE_FORCE_STAR") == "1"
+        _ddtree_chain_prefix = int(os.environ.get("DDTREE_CHAIN_PREFIX", "0"))
         if _ddtree_force_linear:
             (
                 node_token_ids,
@@ -430,6 +547,21 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
                 retrieve_next_sibling_flat,
             ) = build_ddtree_tree_from_topk(
                 top_log_probs[0][:1], top_token_ids[0][:1], tree_budget
+            )
+        elif _ddtree_chain_prefix > 0:
+            (
+                node_token_ids,
+                node_depths,
+                _,
+                child_maps,
+                visibility,
+                retrieve_next_token_flat,
+                retrieve_next_sibling_flat,
+            ) = build_chain_prefill_ddtree_tree_from_topk(
+                top_log_probs[0],
+                top_token_ids[0],
+                tree_budget,
+                _ddtree_chain_prefix,
             )
         else:
             (
@@ -467,15 +599,25 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             )
         )
 
-        tree_tokens = torch.empty((bs, padded_q_len), dtype=torch.long, device=device)
+        self._ensure_ddtree_decode_buffers(bs=bs, q_len=padded_q_len, device=device)
+        assert self._ddtree_tree_tokens_buf is not None
+        assert self._ddtree_tree_positions_buf is not None
+        assert self._ddtree_retrieve_next_token_buf is not None
+        assert self._ddtree_retrieve_next_sibling_buf is not None
+        assert self._ddtree_next_token_ids_bufs
+        assert self._ddtree_commit_lens_bufs
+        assert self._ddtree_accept_index_buf is not None
+        next_token_ids_buf, commit_lens_buf = self._next_ddtree_result_buffers(
+            bs, padded_q_len
+        )
+
+        tree_tokens = self._ddtree_tree_tokens_buf[:bs, :padded_q_len]
         tree_tokens.copy_(block_ids[:, 0:1])  # broadcast bonus across all slots
         if real_q_len > 1:
             tree_tokens[0, 1:real_q_len].copy_(
                 node_token_ids.to(device=device, non_blocking=True)
             )
-        tree_positions = torch.empty(
-            (bs, padded_q_len), dtype=torch.int64, device=device
-        )
+        tree_positions = self._ddtree_tree_positions_buf[:bs, :padded_q_len]
         tree_positions.copy_(prefix_lens.to(torch.int64).unsqueeze(1))
         if real_q_len > 1:
             tree_positions[0, 1:real_q_len].copy_(
@@ -485,15 +627,17 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
 
         # int32 to match the hybrid (GDN/Mamba) backend's captured retrieve
         # buffers and the EAGLE tree-aware kernel convention.
-        retrieve_next_token = (
+        retrieve_next_token = self._ddtree_retrieve_next_token_buf[:bs, :padded_q_len]
+        retrieve_next_sibling = self._ddtree_retrieve_next_sibling_buf[
+            :bs, :padded_q_len
+        ]
+        retrieve_next_token[0].copy_(
             padded_next_token_flat.to(device=device, dtype=torch.int32, non_blocking=True)
-            .view(1, padded_q_len)
-            .contiguous()
         )
-        retrieve_next_sibling = (
-            padded_next_sibling_flat.to(device=device, dtype=torch.int32, non_blocking=True)
-            .view(1, padded_q_len)
-            .contiguous()
+        retrieve_next_sibling[0].copy_(
+            padded_next_sibling_flat.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
         )
 
         verify_input = DFlashDDTreeVerifyInput(
@@ -504,6 +648,9 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             visibility_per_req=[padded_visibility],
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
+            next_token_ids_buf=next_token_ids_buf,
+            commit_lens_buf=commit_lens_buf,
+            accept_index_buf=self._ddtree_accept_index_buf[:bs, :padded_q_len],
         )
         self._profile_mark(profile, "tree_tensors")
 
@@ -553,7 +700,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             next_token_ids,
             commit_lens,
             next_target_hidden,
-            committed_indices_per_req,
+            accept_index,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
@@ -566,7 +713,9 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             self._update_target_mamba_state_after_ddtree_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
-                committed_indices_per_req=committed_indices_per_req,
+                accept_index=accept_index,
+                commit_lens=commit_lens,
+                draft_token_num=padded_q_len,
             )
         self._profile_mark(profile, "mamba_update")
 
@@ -585,17 +734,23 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
                 "DFLASH_DDTREE verify produced no committed hidden states."
             )
         hidden_dim = next_target_hidden.shape[-1]
-        committed_hidden_2d = torch.zeros(
-            (bs, block_size, hidden_dim), dtype=next_target_hidden.dtype, device=device
-        )
-        offset = 0
-        for i in range(bs):
-            cl = int(commit_lens[i].item())
-            committed_hidden_2d[i, :cl] = next_target_hidden[offset : offset + cl]
-            offset += cl
+        if int(next_target_hidden.shape[0]) != bs * block_size:
+            committed_hidden_2d = torch.zeros(
+                (bs, block_size, hidden_dim),
+                dtype=next_target_hidden.dtype,
+                device=device,
+            )
+            offset = 0
+            for i in range(bs):
+                cl = int(commit_lens[i].item())
+                committed_hidden_2d[i, :cl] = next_target_hidden[offset : offset + cl]
+                offset += cl
+            target_hidden_for_draft = committed_hidden_2d.reshape(-1, hidden_dim)
+        else:
+            target_hidden_for_draft = next_target_hidden
 
         self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=committed_hidden_2d.reshape(-1, hidden_dim),
+            target_hidden=target_hidden_for_draft,
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
             positions=positions,
@@ -641,7 +796,9 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
-        committed_indices_per_req: list[list[int]],
+        accept_index: torch.Tensor,
+        commit_lens: torch.Tensor,
+        draft_token_num: int,
     ) -> None:
         """Write back the path-end Mamba/SSM state (tree position of the last
         accepted node, not commit_len-1) after a tree verify. Mirrors
@@ -652,31 +809,47 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        device = seq_lens_pre_verify.device
-        last_correct_step_indices = torch.tensor(
-            [indices[-1] for indices in committed_indices_per_req],
+        bs = int(commit_lens.shape[0])
+        req_idx = torch.arange(bs, dtype=torch.int64, device=commit_lens.device)
+        accept_indices_offset = torch.arange(
+            0,
+            bs * int(draft_token_num),
+            step=int(draft_token_num),
             dtype=torch.int64,
-            device=device,
+            device=commit_lens.device,
+        )
+        last_correct_step_indices = (
+            accept_index[req_idx, (commit_lens.to(torch.int64) - 1)]
+            - accept_indices_offset
         )
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
             mamba_track_interval = self.server_args.mamba_track_interval
+            seq_lens_post_verify = seq_lens_pre_verify + commit_lens.to(
+                seq_lens_pre_verify.dtype
+            )
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
+                != seq_lens_post_verify // mamba_track_interval
             )
             tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
+                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
             )
             to_track_ith = torch.clamp(
                 tracking_point - seq_lens_pre_verify - 1, min=0
             ).to(torch.int64)
-            mamba_steps_to_track = torch.full_like(to_track_ith, -1, dtype=torch.int64)
-            for i, committed_indices in enumerate(committed_indices_per_req):
-                track_i = int(to_track_ith[i].item())
-                if bool(to_track_mask[i].item()) and track_i < len(committed_indices):
-                    mamba_steps_to_track[i] = int(committed_indices[track_i])
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            )
+            candidate_track_steps = (
+                accept_index[req_idx, to_track_ith] - accept_indices_offset
+            )
+            mamba_steps_to_track = torch.where(
+                can_track_mask,
+                candidate_track_steps,
+                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,

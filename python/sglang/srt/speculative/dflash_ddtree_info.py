@@ -16,6 +16,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.dflash_ddtree_utils import follow_verified_tree
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import move_accept_tokens_to_target_kvcache
+from sglang.srt.speculative.triton_ops.ddtree import (
+    _compute_ddtree_accept_triton_unchecked,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -48,6 +51,9 @@ class DFlashDDTreeVerifyInput(SpecInput):
     # needed (full-attention targets).
     retrieve_next_token: torch.Tensor | None = None
     retrieve_next_sibling: torch.Tensor | None = None
+    next_token_ids_buf: torch.Tensor | None = None
+    commit_lens_buf: torch.Tensor | None = None
+    accept_index_buf: torch.Tensor | None = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DDTREE_VERIFY)
@@ -192,7 +198,7 @@ class DFlashDDTreeVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tree accept + KV compaction. Returns the pieces the worker needs.
 
         Does NOT append to `req.output_ids`, advance `batch.seq_lens`, or touch
@@ -208,8 +214,8 @@ class DFlashDDTreeVerifyInput(SpecInput):
         commit_lens: (bs,) number of committed tokens per req (root + accepted drafts).
         next_target_hidden: (sum(commit_lens), hidden) committed path hidden states,
             in per-req path order, for draft-KV materialization.
-        committed_indices_per_req: tree node indices of the accepted path per req
-            (root-leading); used for the path-end Mamba write-back.
+        accept_index: (bs, draft_token_num) global tree indices of the accepted
+            path, padded with -1; used for KV compaction and Mamba write-back.
         """
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
@@ -226,39 +232,89 @@ class DFlashDDTreeVerifyInput(SpecInput):
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, stride
         )
-        candidates_cpu = candidates.cpu()
-        target_predict_cpu = target_predict.cpu()
-
-        next_token_ids_2d = torch.zeros(
-            (bs, stride), dtype=torch.int64, device=device
+        next_token_ids_2d = (
+            self.next_token_ids_buf
+            if self.next_token_ids_buf is not None
+            and self.next_token_ids_buf.shape == (bs, stride)
+            and self.next_token_ids_buf.device == device
+            and self.next_token_ids_buf.dtype == torch.int64
+            else torch.empty((bs, stride), dtype=torch.int64, device=device)
         )
-        commit_lens_cpu: list[int] = []
-        committed_indices_per_req: list[list[int]] = []
+        commit_lens = (
+            self.commit_lens_buf
+            if self.commit_lens_buf is not None
+            and self.commit_lens_buf.shape == (bs,)
+            and self.commit_lens_buf.device == device
+            and self.commit_lens_buf.dtype == torch.int32
+            else torch.empty((bs,), dtype=torch.int32, device=device)
+        )
+        accept_index = (
+            self.accept_index_buf
+            if self.accept_index_buf is not None
+            and self.accept_index_buf.shape == (bs, stride)
+            and self.accept_index_buf.device == device
+            and self.accept_index_buf.dtype == torch.int64
+            else torch.empty((bs, stride), dtype=torch.int64, device=device)
+        )
 
-        for i in range(bs):
-            accepted_indices, next_token = follow_verified_tree(
-                self.child_maps_per_req[i], target_predict_cpu[i]
-            )
-            # Accepted drafts = path nodes after the root; the bonus is the
-            # target's prediction past the last accepted node. commit_len =
-            # root + accepted drafts == accepted drafts + bonus.
-            path_draft_tokens = candidates_cpu[i][
-                [idx for idx in accepted_indices[1:]]
-            ].tolist()
-            emitted = path_draft_tokens + [int(next_token)]
-            commit_len = len(accepted_indices)
-            if commit_len > stride:
-                raise RuntimeError(
-                    "DFLASH_DDTREE accepted path longer than verify width: "
-                    f"commit_len={commit_len}, stride={stride}."
+        use_triton_accept = (
+            candidates.is_cuda
+            and target_predict.is_cuda
+            and self.retrieve_next_token is not None
+            and self.retrieve_next_sibling is not None
+            and self.retrieve_next_token.is_cuda
+            and self.retrieve_next_sibling.is_cuda
+        )
+        if use_triton_accept:
+            try:
+                _compute_ddtree_accept_triton_unchecked(
+                    candidates=candidates.contiguous(),
+                    target_top1=target_predict.contiguous(),
+                    retrieve_next_token=self.retrieve_next_token.contiguous(),
+                    retrieve_next_sibling=self.retrieve_next_sibling.contiguous(),
+                    next_token_ids_out=next_token_ids_2d,
+                    commit_lens_out=commit_lens,
+                    accept_index_out=accept_index,
                 )
-            next_token_ids_2d[i, :commit_len] = torch.tensor(
-                emitted, dtype=torch.int64, device=device
-            )
-            commit_lens_cpu.append(commit_len)
-            committed_indices_per_req.append(accepted_indices)
+            except Exception:
+                use_triton_accept = False
 
-        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+        if not use_triton_accept:
+            candidates_cpu = candidates.cpu()
+            target_predict_cpu = target_predict.cpu()
+            next_token_ids_2d.zero_()
+            accept_index.fill_(-1)
+            commit_lens_cpu: list[int] = []
+
+            for i in range(bs):
+                accepted_indices, next_token = follow_verified_tree(
+                    self.child_maps_per_req[i], target_predict_cpu[i]
+                )
+                # Accepted drafts = path nodes after the root; the bonus is the
+                # target's prediction past the last accepted node. commit_len =
+                # root + accepted drafts == accepted drafts + bonus.
+                path_draft_tokens = candidates_cpu[i][
+                    [idx for idx in accepted_indices[1:]]
+                ].tolist()
+                emitted = path_draft_tokens + [int(next_token)]
+                commit_len = len(accepted_indices)
+                if commit_len > stride:
+                    raise RuntimeError(
+                        "DFLASH_DDTREE accepted path longer than verify width: "
+                        f"commit_len={commit_len}, stride={stride}."
+                    )
+                next_token_ids_2d[i, :commit_len] = torch.tensor(
+                    emitted, dtype=torch.int64, device=device
+                )
+                idx_tensor = torch.tensor(
+                    accepted_indices, dtype=torch.int64, device=device
+                )
+                accept_index[i, : idx_tensor.numel()] = i * stride + idx_tensor
+                commit_lens_cpu.append(commit_len)
+
+            commit_lens.copy_(
+                torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+            )
 
         # --- Compact the accepted tree path into the CONTIGUOUS front of each
         # per-req verify block, matching linear DFlash's KV layout.
@@ -283,13 +339,6 @@ class DFlashDDTreeVerifyInput(SpecInput):
         # Non-accepted slots stay in the reserved region and are reclaimed at
         # request finish, exactly like linear DFlash's [commit_len:block] tail.
         out_cache_loc_2d = batch.out_cache_loc.view(bs, stride)
-        accept_index = torch.full((bs, stride), -1, dtype=torch.int64, device=device)
-        for i, committed_indices in enumerate(committed_indices_per_req):
-            idx_tensor = torch.tensor(
-                committed_indices, dtype=torch.int64, device=device
-            )
-            accept_index[i, : idx_tensor.numel()] = i * stride + idx_tensor
-
         move_accept_tokens_to_target_kvcache(
             batch,
             accept_index,
@@ -297,14 +346,10 @@ class DFlashDDTreeVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator,
         )
 
-        # After the move the committed slots are the block's contiguous prefix;
-        # expose them as `out_cache_loc` for downstream bookkeeping.
-        selected_locs = [out_cache_loc_2d[i, : commit_lens_cpu[i]] for i in range(bs)]
-        batch.out_cache_loc = (
-            torch.cat(selected_locs, dim=0)
-            if selected_locs
-            else batch.out_cache_loc.reshape(-1)[:0]
-        )
+        # After the move, committed slots are the block prefix. Keep the full
+        # fixed-width tensor here so the hot path does not need a GPU->CPU scalar
+        # read just to slice a bookkeeping tensor.
+        batch.out_cache_loc = out_cache_loc_2d.reshape(-1)
 
         # --- Concatenate committed path hidden states (path order) for the
         # draft-KV materialization step in the worker. ---
@@ -312,17 +357,13 @@ class DFlashDDTreeVerifyInput(SpecInput):
         if hidden is None:
             raise RuntimeError("DFLASH_DDTREE verify requires target hidden states.")
         hidden = hidden.view(bs, stride, -1)
-        segments: list[torch.Tensor] = []
-        for i, committed_indices in enumerate(committed_indices_per_req):
-            if committed_indices:
-                idx_tensor = torch.tensor(
-                    committed_indices, dtype=torch.long, device=hidden.device
-                )
-                segments.append(hidden[i].index_select(0, idx_tensor))
-        next_target_hidden = (
-            torch.cat(segments, dim=0)
-            if segments
-            else hidden.reshape(-1, hidden.shape[-1])[:0]
+        row_offsets = torch.arange(
+            0, bs * stride, step=stride, dtype=torch.int64, device=device
+        ).unsqueeze(1)
+        local_accept_index = (accept_index - row_offsets).clamp(min=0)
+        gather_index = local_accept_index.unsqueeze(-1).expand(-1, -1, hidden.shape[-1])
+        next_target_hidden = torch.gather(hidden, 1, gather_index).reshape(
+            bs * stride, hidden.shape[-1]
         )
 
         logits_output.hidden_states = None
@@ -331,5 +372,5 @@ class DFlashDDTreeVerifyInput(SpecInput):
             next_token_ids_2d.reshape(-1),
             commit_lens,
             next_target_hidden,
-            committed_indices_per_req,
+            accept_index,
         )
