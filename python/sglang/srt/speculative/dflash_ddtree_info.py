@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
@@ -43,6 +43,8 @@ class DFlashDDTreeVerifyInput(SpecInput):
     visibility_per_req: list[torch.Tensor]
     topk: int = 1
     custom_mask: torch.Tensor | None = None
+    custom_mask_buf: torch.Tensor | None = None
+    prefix_lens_cpu: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     num_tokens_per_batch: int = -1
     # EAGLE-style first-child / next-sibling tensors for tree-aware verify in
@@ -87,17 +89,49 @@ class DFlashDDTreeVerifyInput(SpecInput):
         # Tree visibility mask: each query row = [prefix_allow | visibility].
         # `prefix_allow` is True over the whole committed prefix; `visibility`
         # restricts the verify segment to the query's ancestor path + itself.
-        # Use `batch.seq_lens` (GPU, never raised to the verify host bound) so
-        # the prefix width is the committed length before this verify.
+        # Use the committed CPU copy supplied by the worker. Reading
+        # `batch.seq_lens` here would force a GPU->CPU sync on the verify hot path,
+        # and `batch.seq_lens_cpu` may be temporarily raised to the verify host
+        # bound (prefix + block) while attention metadata is initialized.
         if not batch.forward_mode.is_idle():
-            mask_chunks: List[torch.Tensor] = []
             q_len = int(self.draft_token_num)
-            prefix_lens = batch.seq_lens.tolist()
+            if self.prefix_lens_cpu is not None:
+                if self.prefix_lens_cpu.is_cuda:
+                    raise RuntimeError(
+                        "DFLASH_DDTREE prefix_lens_cpu must be a CPU tensor."
+                    )
+                prefix_lens = [
+                    int(x)
+                    for x in self.prefix_lens_cpu[: batch.batch_size()].tolist()
+                ]
+            elif batch.seq_lens_cpu is not None:
+                prefix_lens = [
+                    int(x)
+                    for x in batch.seq_lens_cpu[: batch.batch_size()].tolist()
+                ]
+            else:
+                raise RuntimeError(
+                    "DFLASH_DDTREE requires CPU prefix lengths to build the verify "
+                    "mask without synchronizing GPU seq_lens."
+                )
+
+            mask_numel = sum(
+                q_len * (int(prefix_len_i) + q_len) for prefix_len_i in prefix_lens
+            )
+            if (
+                self.custom_mask_buf is None
+                or self.custom_mask_buf.device != batch.device
+                or self.custom_mask_buf.dtype != torch.bool
+                or self.custom_mask_buf.numel() < mask_numel
+            ):
+                self.custom_mask_buf = torch.empty(
+                    (mask_numel,), dtype=torch.bool, device=batch.device
+                )
+
+            mask = self.custom_mask_buf[:mask_numel]
+            offset = 0
             for req_idx, prefix_len_i in enumerate(prefix_lens):
                 prefix_len_i = int(prefix_len_i)
-                prefix_allow = torch.ones(
-                    (q_len, prefix_len_i), dtype=torch.bool, device=batch.device
-                )
                 visibility = self.visibility_per_req[req_idx].to(
                     device=batch.device, dtype=torch.bool, non_blocking=True
                 )
@@ -106,14 +140,15 @@ class DFlashDDTreeVerifyInput(SpecInput):
                         "DFLASH_DDTREE visibility shape mismatch: "
                         f"expected {(q_len, q_len)}, got {tuple(visibility.shape)}."
                     )
-                mask_chunks.append(
-                    torch.cat([prefix_allow, visibility], dim=1).flatten()
+                req_mask_numel = q_len * (prefix_len_i + q_len)
+                req_mask = mask[offset : offset + req_mask_numel].view(
+                    q_len, prefix_len_i + q_len
                 )
-            self.custom_mask = (
-                torch.cat(mask_chunks, dim=0)
-                if mask_chunks
-                else torch.empty((0,), dtype=torch.bool, device=batch.device)
-            )
+                if prefix_len_i > 0:
+                    req_mask[:, :prefix_len_i].fill_(True)
+                req_mask[:, prefix_len_i:].copy_(visibility)
+                offset += req_mask_numel
+            self.custom_mask = mask
 
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 

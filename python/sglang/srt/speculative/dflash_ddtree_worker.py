@@ -40,10 +40,6 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
     targets), and accept/commit follows a root-to-leaf path instead of a linear
     prefix. Prefill and idle are identical to DFlash and delegated to the V2
     parent.
-
-    MVP scope: greedy, batch_size == 1, triton custom-mask verify, cuda graph
-    disabled. Hybrid GDN/Mamba retrieve and cuda-graph capture/replay land in a
-    follow-up (the retrieve tensors are already plumbed through).
     """
 
     def __init__(self, *args, **kwargs):
@@ -53,13 +49,16 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         self._ddtree_topk_indices_buf: torch.Tensor | None = None
         self._ddtree_tree_tokens_buf: torch.Tensor | None = None
         self._ddtree_tree_positions_buf: torch.Tensor | None = None
+        self._ddtree_visibility_buf: torch.Tensor | None = None
         self._ddtree_retrieve_next_token_buf: torch.Tensor | None = None
         self._ddtree_retrieve_next_sibling_buf: torch.Tensor | None = None
         self._ddtree_next_token_ids_bufs: list[torch.Tensor] = []
         self._ddtree_commit_lens_bufs: list[torch.Tensor] = []
         self._ddtree_result_buf_index = 0
         self._ddtree_accept_index_buf: torch.Tensor | None = None
+        self._ddtree_custom_mask_buf: torch.Tensor | None = None
         self._ddtree_build_workspace = DFlashDDTreeBuildWorkspace()
+        self._ddtree_build_workspaces = [self._ddtree_build_workspace]
         # CUDA graph capture locks the verify-sequence shape, so the worker must
         # always emit exactly `1 + tree_budget` verify tokens (padding the tree
         # to a fixed width when the heap drains early). `_handle_dflash_ddtree`
@@ -120,6 +119,9 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             self._ddtree_tree_positions_buf = torch.empty(
                 tree_shape, dtype=torch.int64, device=device
             )
+            self._ddtree_visibility_buf = torch.empty(
+                (int(bs), int(q_len), int(q_len)), dtype=torch.bool, device=device
+            )
             self._ddtree_retrieve_next_token_buf = torch.empty(
                 tree_shape, dtype=torch.int32, device=device
             )
@@ -144,6 +146,29 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
             self._ddtree_next_token_ids_bufs[self._ddtree_result_buf_index][:bs, :q_len],
             self._ddtree_commit_lens_bufs[self._ddtree_result_buf_index][:bs],
         )
+
+    def _ensure_ddtree_custom_mask_buffer(
+        self, *, numel: int, device: torch.device
+    ) -> torch.Tensor:
+        if numel < 0:
+            raise ValueError(
+                f"DFLASH_DDTREE custom mask size must be non-negative, got {numel}."
+            )
+        if (
+            self._ddtree_custom_mask_buf is None
+            or self._ddtree_custom_mask_buf.device != device
+            or self._ddtree_custom_mask_buf.numel() < numel
+        ):
+            cap = max(
+                int(numel),
+                2 * int(self._ddtree_custom_mask_buf.numel())
+                if self._ddtree_custom_mask_buf is not None
+                else 0,
+            )
+            self._ddtree_custom_mask_buf = torch.empty(
+                (cap,), dtype=torch.bool, device=device
+            )
+        return self._ddtree_custom_mask_buf[:numel]
 
     def _topk_from_vocab_parallel_head(
         self,
@@ -288,18 +313,10 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         )
         return top_logits - log_z[:, None], top_ids
 
-    def _build_tree_from_topk(
-        self,
-        top_log_probs: torch.Tensor,
-        top_token_ids: torch.Tensor,
-        tree_budget: int,
-    ):
-        return build_ddtree_tree_from_topk(
-            top_log_probs,
-            top_token_ids,
-            tree_budget,
-            workspace=self._ddtree_build_workspace,
-        )
+    def _ddtree_build_workspace_for_req(self, req_idx: int) -> DFlashDDTreeBuildWorkspace:
+        while len(self._ddtree_build_workspaces) <= req_idx:
+            self._ddtree_build_workspaces.append(DFlashDDTreeBuildWorkspace())
+        return self._ddtree_build_workspaces[req_idx]
 
     def forward_batch_generation(
         self,
@@ -318,11 +335,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         if batch.forward_mode.is_idle():
             return super().forward_batch_generation(batch, on_publish)
 
-        # MVP guards (tree accept is per-request and greedy-only for now).
-        if batch.batch_size() != 1:
-            raise RuntimeError(
-                "DFLASH_DDTREE MVP only supports concurrency=1 / batch_size=1."
-            )
+        # MVP guard: tree accept is greedy-only for now.
         if batch.has_grammar:
             raise RuntimeError("DFLASH_DDTREE MVP does not support grammar constraints.")
 
@@ -526,82 +539,48 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         _ddtree_force_linear = os.environ.get("DDTREE_FORCE_LINEAR") == "1"
         _ddtree_force_star = os.environ.get("DDTREE_FORCE_STAR") == "1"
         _ddtree_chain_prefix = int(os.environ.get("DDTREE_CHAIN_PREFIX", "0"))
-        if _ddtree_force_linear:
-            (
-                node_token_ids,
-                node_depths,
-                _,
-                child_maps,
-                visibility,
-                retrieve_next_token_flat,
-                retrieve_next_sibling_flat,
-            ) = build_linear_ddtree_tree_from_topk(top_token_ids[0], tree_budget)
-        elif _ddtree_force_star:
-            (
-                node_token_ids,
-                node_depths,
-                _,
-                child_maps,
-                visibility,
-                retrieve_next_token_flat,
-                retrieve_next_sibling_flat,
-            ) = build_ddtree_tree_from_topk(
-                top_log_probs[0][:1], top_token_ids[0][:1], tree_budget
-            )
-        elif _ddtree_chain_prefix > 0:
-            (
-                node_token_ids,
-                node_depths,
-                _,
-                child_maps,
-                visibility,
-                retrieve_next_token_flat,
-                retrieve_next_sibling_flat,
-            ) = build_chain_prefill_ddtree_tree_from_topk(
-                top_log_probs[0],
-                top_token_ids[0],
-                tree_budget,
-                _ddtree_chain_prefix,
-            )
-        else:
-            (
-                node_token_ids,
-                node_depths,
-                _,
-                child_maps,
-                visibility,
-                retrieve_next_token_flat,
-                retrieve_next_sibling_flat,
-            ) = build_ddtree_tree_from_topk(
-                top_log_probs[0], top_token_ids[0], tree_budget
-            )
+        tree_build_outputs = []
+        for req_idx in range(bs):
+            if _ddtree_force_linear:
+                tree_build_outputs.append(
+                    build_linear_ddtree_tree_from_topk(
+                        top_token_ids[req_idx], tree_budget
+                    )
+                )
+            elif _ddtree_force_star:
+                tree_build_outputs.append(
+                    build_ddtree_tree_from_topk(
+                        top_log_probs[req_idx][:1],
+                        top_token_ids[req_idx][:1],
+                        tree_budget,
+                    )
+                )
+            elif _ddtree_chain_prefix > 0:
+                tree_build_outputs.append(
+                    build_chain_prefill_ddtree_tree_from_topk(
+                        top_log_probs[req_idx],
+                        top_token_ids[req_idx],
+                        tree_budget,
+                        _ddtree_chain_prefix,
+                    )
+                )
+            else:
+                tree_build_outputs.append(
+                    build_ddtree_tree_from_topk(
+                        top_log_probs[req_idx],
+                        top_token_ids[req_idx],
+                        tree_budget,
+                        workspace=self._ddtree_build_workspace_for_req(req_idx),
+                    )
+                )
         self._profile_mark(profile, "tree_build_cpu")
 
-        # Pad the verify sequence to a fixed width of `1 + tree_budget` so the
-        # cuda-graph backends see a fixed shape even when the heap drains early.
-        # Pad-slot semantics: tree_tokens[pad] = bonus (hidden by visibility),
-        # tree_positions[pad] = prefix len, retrieve_*[pad] = -1,
-        # visibility[pad, *] = visibility[*, pad] = False.
-        real_q_len = 1 + int(node_token_ids.numel())
         padded_q_len = 1 + tree_budget
-        if real_q_len > padded_q_len:
-            raise RuntimeError(
-                "DFLASH_DDTREE build_ddtree_tree_from_topk produced more nodes "
-                f"({real_q_len - 1}) than tree_budget ({tree_budget})."
-            )
-
-        padded_visibility, padded_next_token_flat, padded_next_sibling_flat = (
-            pad_ddtree_build_outputs(
-                visibility,
-                retrieve_next_token_flat,
-                retrieve_next_sibling_flat,
-                padded_q_len,
-            )
-        )
 
         self._ensure_ddtree_decode_buffers(bs=bs, q_len=padded_q_len, device=device)
         assert self._ddtree_tree_tokens_buf is not None
         assert self._ddtree_tree_positions_buf is not None
+        assert self._ddtree_visibility_buf is not None
         assert self._ddtree_retrieve_next_token_buf is not None
         assert self._ddtree_retrieve_next_sibling_buf is not None
         assert self._ddtree_next_token_ids_bufs
@@ -613,17 +592,12 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
 
         tree_tokens = self._ddtree_tree_tokens_buf[:bs, :padded_q_len]
         tree_tokens.copy_(block_ids[:, 0:1])  # broadcast bonus across all slots
-        if real_q_len > 1:
-            tree_tokens[0, 1:real_q_len].copy_(
-                node_token_ids.to(device=device, non_blocking=True)
-            )
         tree_positions = self._ddtree_tree_positions_buf[:bs, :padded_q_len]
         tree_positions.copy_(prefix_lens.to(torch.int64).unsqueeze(1))
-        if real_q_len > 1:
-            tree_positions[0, 1:real_q_len].copy_(
-                prefix_lens[0].to(torch.int64)
-                + node_depths.to(device=device, dtype=torch.int64, non_blocking=True)
-            )
+
+        visibility_buf = self._ddtree_visibility_buf[
+            :bs, :padded_q_len, :padded_q_len
+        ]
 
         # int32 to match the hybrid (GDN/Mamba) backend's captured retrieve
         # buffers and the EAGLE tree-aware kernel convention.
@@ -631,21 +605,81 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         retrieve_next_sibling = self._ddtree_retrieve_next_sibling_buf[
             :bs, :padded_q_len
         ]
-        retrieve_next_token[0].copy_(
-            padded_next_token_flat.to(device=device, dtype=torch.int32, non_blocking=True)
-        )
-        retrieve_next_sibling[0].copy_(
-            padded_next_sibling_flat.to(
-                device=device, dtype=torch.int32, non_blocking=True
+        child_maps_per_req = []
+        visibility_per_req = []
+        for req_idx, (
+            node_token_ids,
+            node_depths,
+            _,
+            child_maps,
+            visibility,
+            retrieve_next_token_flat,
+            retrieve_next_sibling_flat,
+        ) in enumerate(tree_build_outputs):
+            real_q_len = 1 + int(node_token_ids.numel())
+            if real_q_len > padded_q_len:
+                raise RuntimeError(
+                    "DFLASH_DDTREE build_ddtree_tree_from_topk produced more nodes "
+                    f"({real_q_len - 1}) than tree_budget ({tree_budget})."
+                )
+
+            padded_visibility, padded_next_token_flat, padded_next_sibling_flat = (
+                pad_ddtree_build_outputs(
+                    visibility,
+                    retrieve_next_token_flat,
+                    retrieve_next_sibling_flat,
+                    padded_q_len,
+                )
             )
-        )
+            if real_q_len > 1:
+                tree_tokens[req_idx, 1:real_q_len].copy_(
+                    node_token_ids.to(device=device, non_blocking=True)
+                )
+                tree_positions[req_idx, 1:real_q_len].copy_(
+                    prefix_lens[req_idx].to(torch.int64)
+                    + node_depths.to(device=device, dtype=torch.int64, non_blocking=True)
+                )
+            visibility_buf[req_idx].copy_(padded_visibility, non_blocking=True)
+            retrieve_next_token[req_idx].copy_(
+                padded_next_token_flat.to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+            )
+            retrieve_next_sibling[req_idx].copy_(
+                padded_next_sibling_flat.to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+            )
+            child_maps_per_req.append(child_maps)
+            visibility_per_req.append(visibility_buf[req_idx])
+
+        prefix_lens_cpu_for_mask = batch.seq_lens_cpu
+        if (
+            prefix_lens_cpu_for_mask is None
+            and draft_input.reserved_seq_lens_cpu is not None
+        ):
+            prefix_lens_cpu_for_mask = (
+                draft_input.reserved_seq_lens_cpu[:bs] - block_size
+            )
+        custom_mask_buf = None
+        if prefix_lens_cpu_for_mask is not None:
+            prefix_lens_sum = int(prefix_lens_cpu_for_mask[:bs].sum())
+            custom_mask_numel = padded_q_len * (
+                prefix_lens_sum + bs * padded_q_len
+            )
+            custom_mask_buf = self._ensure_ddtree_custom_mask_buffer(
+                numel=custom_mask_numel,
+                device=device,
+            )
 
         verify_input = DFlashDDTreeVerifyInput(
             draft_token=tree_tokens.reshape(-1),
             positions=tree_positions.reshape(-1),
             draft_token_num=padded_q_len,
-            child_maps_per_req=[child_maps],
-            visibility_per_req=[padded_visibility],
+            child_maps_per_req=child_maps_per_req,
+            visibility_per_req=visibility_per_req,
+            custom_mask_buf=custom_mask_buf,
+            prefix_lens_cpu=prefix_lens_cpu_for_mask,
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             next_token_ids_buf=next_token_ids_buf,
@@ -775,10 +809,7 @@ class DFlashDDTreeWorker(DFlashWorkerV2):
         self._profile_finish(profile, label="DDTREE", commit_lens=commit_lens)
 
         if not getattr(self, "_logged_first_verify", False) and self.tp_rank == 0:
-            logger.info(
-                "DFLASH_DDTREE verify completed. commit_lens=%s",
-                commit_lens.tolist(),
-            )
+            logger.info("DFLASH_DDTREE verify completed.")
             self._logged_first_verify = True
 
         return GenerationBatchResult(
